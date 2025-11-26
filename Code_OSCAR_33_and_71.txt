@@ -1,0 +1,1028 @@
+# ==============================================================================
+# SPARSE GL-k INVARIANTS over GF(2)  —  Highest-weight-only global construction
+# Hit → (online elimination OR spill+merge) → admissible
+# Σk / GLk by weight-spaces with projection (precomputed (ρ_j−I) rows)
+# Stage 1: solve f ≡ γ·g + Σ β_i g'_i with (ρ_j−I)f≡0 for j=1..k−1 via kernel
+# Stage 2: solve (ρ_k−I) Σ λ_j Φ_j = 0 directly on kernel coordinates λ
+# Print h0 (from β_i=γ), the grouped g''_s, the candidate f, and VERIFY ρ_i for i=1..k
+# ==============================================================================
+
+using Distributed, Printf, Oscar, Random
+using Logging, LoggingExtras
+using Base.Threads
+
+# ---------- Parallel ----------
+const DESIRED_WORKERS = 12
+if nprocs() == 1
+    try
+        addprocs(max(0, DESIRED_WORKERS - 1))
+    catch
+        @warn "addprocs failed"
+    end
+end
+@everywhere using Oscar
+
+# ---------- Logging to file (avoid notebook truncation) ----------
+const __ORIG_STDOUT__ = Ref{IO}(stdout)
+const __ORIG_STDERR__ = Ref{IO}(stderr)
+const __LOG_FILE_IO__ = Ref{IO}(stdout)
+const __LOG_FILENAME__ = Ref{String}("")
+
+function setup_logging(k::Int, d::Int)
+    log_filename = "output_k$(k)_d$(d)_$(round(Int, time())).log"
+    log_file_io = open(log_filename, "w")
+
+    # Try to uncap IJulia stdout if present
+    try
+        @eval begin
+            import IJulia
+            IJulia.set_max_stdio(typemax(Int))
+        end
+        @info "IJulia stdout cap disabled (unlimited)."
+    catch
+        @info "IJulia not detected or cannot set max stdio; using file redirection."
+    end
+
+    __LOG_FILE_IO__[] = log_file_io
+    __LOG_FILENAME__[] = log_filename
+    console_logger = ConsoleLogger(__ORIG_STDOUT__[])
+    file_logger    = SimpleLogger(log_file_io)
+    global_logger(TeeLogger(console_logger, file_logger))
+
+    redirect_stdout(log_file_io)
+    redirect_stderr(log_file_io)
+
+    @info "Logging started. Full untruncated output -> $log_filename"
+    atexit(() -> try
+        flush(log_file_io); close(log_file_io)
+        redirect_stdout(__ORIG_STDOUT__[]); redirect_stderr(__ORIG_STDERR__[])
+        @info "Closed $log_filename"
+    catch
+    end)
+end
+
+# ---------- Tunables ----------
+const DEFAULT_BATCH   = 256
+const MIN_BATCH       = 32
+const MAX_BATCH       = 4096
+const PRINT_EVERY     = 10_000
+const WRAP_WIDTH      = 100
+
+const USE_ONLINE_ELIMINATION = true
+const MAX_COLS_PER_FILE  = 200_000
+const KEEP_SPILL_FILES   = false
+
+# ---------- RAM thresholds ----------
+const __RAM_TOTAL_MB__ = Int(round(Sys.total_memory() / 1024^2))
+const RAM_SOFT_MB = try parse(Int, get(ENV, "RAM_SOFT_MB", "")) catch; 0 end
+const RAM_HARD_MB = try parse(Int, get(ENV, "RAM_HARD_MB", "")) catch; 0 end
+const SOFT_MB = RAM_SOFT_MB > 0 ? RAM_SOFT_MB : max(8_192, (__RAM_TOTAL_MB__ * 60) ÷ 100)
+const HARD_MB = RAM_HARD_MB > 0 ? RAM_HARD_MB : max(12_288, (__RAM_TOTAL_MB__ * 85) ÷ 100)
+approx_used_mb() = (GC.gc(false); try Base.gc_live_bytes() / 1024^2 catch; 0.0 end)
+
+@info "RAM thresholds (MB)" total=__RAM_TOTAL_MB__ soft=SOFT_MB hard=HARD_MB
+
+# ---------- Types / helpers ----------
+const WeightKey = NTuple{N,Int} where N
+
+function get_exponent_vector_fast(m, k::Int)
+    P = parent(m); rk = nvars(P)
+    r = Vector{Int}(undef, k)
+    @inbounds for i in 1:k
+        r[i] = i <= rk ? degree(m, i) : 0
+    end
+    r
+end
+
+function get_weight_vector_optimized(m, k::Int)
+    s = get_exponent_vector_fast(m, k)
+    all(==(0), s) && return Int[]
+    mx = maximum(s); mx == 0 && return Int[]
+    mb = 0; t = mx
+    while t > 0; mb += 1; t >>>= 1; end
+    w = Vector{Int}(undef, mb)
+    @inbounds for i in 0:mb-1
+        pow2 = 1 << i; c = 0
+        for e in s; ((e ÷ pow2) & 1) == 1 && (c += 1); end
+        w[i + 1] = c
+    end
+    w
+end
+
+compare_monomials_optimized(m1, m2) = begin
+    k  = nvars(parent(m1))
+    w1 = get_weight_vector_optimized(m1, k)
+    w2 = get_weight_vector_optimized(m2, k)
+    w1 == w2 ? (get_exponent_vector_fast(m1, k) < get_exponent_vector_fast(m2, k)) : (w1 < w2)
+end
+
+to_exps_tuple(m, k) = ntuple(i -> degree(m, i), k)
+
+# enumerate exponent k-tuples with sum=deg
+function exps_enum(k::Int, deg::Int)
+    stk = [(1, Int[], deg)]
+    out = NTuple{k, Int}[]
+    while !isempty(stk)
+        i, cur, rem = pop!(stk)
+        if i == k
+            t = (cur..., rem)
+            push!(out, ntuple(j -> t[j], k))
+        else
+            @inbounds for e in 0:rem
+                push!(stk, (i + 1, [cur...; e], rem - e))
+            end
+        end
+    end
+    out
+end
+
+# ---------- @everywhere core ----------
+@everywhere function build_ring(k::Int)
+    first(polynomial_ring(GF(2), ["x$i" for i in 1:k]))
+end
+
+@everywhere function mono_from_exps(P, exps::NTuple{K, Int}) where {K}
+    m = one(P)
+    @inbounds for i in 1:K
+        exps[i] != 0 && (m *= gen(P, i)^exps[i])
+    end
+    m
+end
+
+@everywhere function steenrod_square_optimized(k_op::Int, mono, P, memo::IdDict{Any, Any})
+    (iszero(mono) || k_op < 0) && return zero(P)
+    k_op == 0 && return mono
+    st = (k_op, mono)
+    haskey(memo, st) && return memo[st]
+    isone(mono) && return (memo[st] = (k_op == 0 ? one(P) : zero(P)))
+    fidx = -1
+    for i in 1:nvars(P)
+        if degree(mono, i) > 0
+            fidx = i; break
+        end
+    end
+    fidx == -1 && return (memo[st] = zero(P))
+    v = gen(P, fidx); e = degree(mono, fidx)
+    rest = divexact(mono, v^e)
+    tot = zero(P)
+    @inbounds for i in 0:k_op
+        isodd(binomial(e, i)) || continue
+        tot += v^(e + i) * steenrod_square_optimized(k_op - i, rest, P, memo)
+    end
+    memo[st] = tot
+end
+
+@everywhere function steenrod_square_poly_optimized(k_op::Int, f, P)
+    (iszero(f) || k_op < 0) && return zero(P)
+    k_op == 0 && return f
+    memo = IdDict{Any, Any}(); res = zero(P)
+    for m in monomials(f)
+        coeff(f, m) == base_ring(P)(1) || continue
+        res += steenrod_square_optimized(k_op, m, P, memo)
+    end
+    res
+end
+
+# ---------- Workers: return only exponent tuples ----------
+@everywhere function column_exps_only!(exps_g::NTuple{K, Int}, k_op::Int, k::Int) where {K}
+    P  = build_ring(k)
+    g  = mono_from_exps(P, exps_g)
+    sq = steenrod_square_poly_optimized(k_op, g, P)
+    iszero(sq) && return NTuple{k,Int}[]
+    seen = Set{NTuple{k,Int}}()
+    for t in monomials(sq)
+        ex = ntuple(i -> degree(t, i), k)
+        if ex in seen; delete!(seen, ex) else; push!(seen, ex) end
+    end
+    rows_exps = collect(seen)
+    sort!(rows_exps)
+    rows_exps
+end
+
+# ---------- XOR helpers ----------
+function xor_sorted!(a::Vector{Int}, b::Vector{Int})
+    i = 1; j = 1; out = Int[]
+    while i <= length(a) && j <= length(b)
+        if a[i] == b[j]
+            i += 1; j += 1
+        elseif a[i] < b[j]
+            push!(out, a[i]); i += 1
+        else
+            push!(out, b[j]); j += 1
+        end
+    end
+    while i <= length(a); push!(out, a[i]); i += 1; end
+    while j <= length(b); push!(out, b[j]); j += 1; end
+    empty!(a); append!(a, out); a
+end
+
+@everywhere function _xor_sorted_local(rows::Vector{Int}, a::Vector{Int})
+    i = 1; j = 1; out = Int[]
+    while i <= length(rows) && j <= length(a)
+        if rows[i] == a[j]
+            i += 1; j += 1
+        elseif rows[i] < a[j]
+            push!(out, rows[i]); i += 1
+        else
+            push!(out, a[j]); j += 1
+        end
+    end
+    while i <= length(rows); push!(out, rows[i]); i += 1; end
+    while j <= length(a); push!(out, a[j]); j += 1; end
+    out
+end
+
+# ---------- Map exponent-rows -> global column indices (parity over GF(2)) ----------
+function xor_rows_to_indices!(
+    rows_exps::Vector{NTuple{K,Int}} where K,
+    mono_to_idx_exps::Dict{NTuple{K,Int},Int} where K
+)::Vector{Int}
+    idxs = Int[]
+    for ex in rows_exps
+        idx = get(mono_to_idx_exps, ex, 0)
+        idx == 0 && continue
+        push!(idxs, idx)
+    end
+    sort!(idxs)
+    if isempty(idxs)
+        return idxs
+    end
+    out = Int[]; last = 0; cnt = 0
+    for v in idxs
+        if v == last
+            cnt += 1
+        else
+            (cnt % 2 == 1 && last != 0) && push!(out, last)
+            last = v; cnt = 1
+        end
+    end
+    (cnt % 2 == 1) && push!(out, last)
+    return out
+end
+
+# ---------- Spill (fallback) ----------
+mutable struct SpillWriter
+    dir::String; prefix::String; maxcols::Int
+    file_index::Int; col_in_current::Int; current_io::IO
+    files::Vector{String}
+end
+function SpillWriter(dir::String, prefix::String; maxcols::Int = MAX_COLS_PER_FILE)
+    isdir(dir) || mkpath(dir)
+    io = open(joinpath(dir, "$(prefix)_part1.txt"), "w")
+    SpillWriter(dir, prefix, maxcols, 1, 0, io, String[])
+end
+close!(sw::SpillWriter) = (try
+    close(sw.current_io)
+    push!(sw.files, joinpath(sw.dir, "$(sw.prefix)_part$(sw.file_index).txt"))
+catch
+end)
+function rotate!(sw::SpillWriter)
+    close(sw.current_io)
+    push!(sw.files, joinpath(sw.dir, "$(sw.prefix)_part$(sw.file_index).txt"))
+    sw.file_index += 1
+    sw.col_in_current = 0
+    sw.current_io = open(joinpath(sw.dir, "$(sw.prefix)_part$(sw.file_index).txt"), "w")
+end
+function append_column!(sw::SpillWriter, rows::Vector{Int})
+    sw.col_in_current >= sw.maxcols && rotate!(sw)
+    println(sw.current_io, join(rows, ","))
+    sw.col_in_current += 1
+end
+finish!(sw::SpillWriter) = (close!(sw); sw.files)
+
+@everywhere function _elim_one_file(f::String)
+    piv     = Dict{Int, Vector{Int}}(); pivkeys = Int[]; total = 0
+    open(f, "r") do io
+        for line in eachline(io)
+            isempty(line) && continue
+            total += 1
+            rows = map(x -> parse(Int, x), split(line, ','))
+            while !isempty(rows)
+                r = rows[end]
+                if haskey(piv, r)
+                    rows = _xor_sorted_local(rows, piv[r])
+                else
+                    piv[r] = copy(rows); push!(pivkeys, r); break
+                end
+            end
+        end
+    end
+    sort!(pivkeys); return piv, pivkeys, total
+end
+
+function _merge_pivotmaps!(P::Dict{Int, Vector{Int}}, K::Vector{Int},
+                           Q::Dict{Int, Vector{Int}}, KQ::Vector{Int})
+    for r in KQ
+        rows = Q[r]
+        while !isempty(rows)
+            rr = rows[end]
+            if haskey(P, rr)
+                rows = _xor_sorted_local(rows, P[rr])
+            else
+                P[rr] = copy(rows); push!(K, rr); break
+            end
+        end
+    end
+    sort!(K); return P, K
+end
+
+function column_echelon_stream_parallel!(spill_files::Vector{String})
+    @printf "    - Parallel elimination across %d spill files…\n" length(spill_files)
+    parts = pmap(_elim_one_file, spill_files; batch_size=1)
+    P = Dict{Int, Vector{Int}}(); K = Int[]; total = 0
+    for (i, (piv, keys, tot)) in enumerate(parts)
+        total += tot
+        _merge_pivotmaps!(P, K, piv, keys)
+        @printf "      merged %d/%d files: pivots=%d (cum cols=%d)\n" i length(parts) length(K) total
+    end
+    @printf "    - Done: %d columns, pivots=%d\n" total length(K)
+    return P, K, total
+end
+
+# ---------- GLOBAL STATE ----------
+global __all_monos_sorted__::Vector = Vector{Any}()
+global __mono_to_idx_exps__::Dict   = Dict{Any,Int}()
+global __pivotmap__::Dict{Int,Vector{Int}} = Dict{Int,Vector{Int}}()
+global __pivots__::Vector{Int}      = Int[]
+global __admissible_indices__::Vector{Int} = Int[]
+global __admissible_basis__::Vector = Vector{Any}()
+global __adpos__::Dict{Int,Int}     = Dict{Int,Int}()
+global __reduce_cache__::Dict{Int,Vector{Int}} = Dict{Int,Vector{Int}}()
+global __rho_rows_table__::Dict{Int, Vector{Vector{Int}}} = Dict{Int, Vector{Vector{Int}}}()
+
+# ---------- STEP 1: admissible (online elim default) ----------
+function find_admissible_basis_streaming(degree::Int, k::Int, P)
+    @printf "--> Computing admissible basis (STREAM + ONLINE ELIM) for k=%d, d=%d\n" k degree
+    println("    - Generating & sorting monomials…")
+    mono_time = @elapsed begin
+        all_monos = collect(monomials_of_degree(P, degree))
+        sort!(all_monos, lt = compare_monomials_optimized)
+        global __all_monos_sorted__ = all_monos
+    end
+    @printf "      %d monomials ready in %.1fs\n" length(__all_monos_sorted__) mono_time
+
+    mono_to_idx_exps = Dict{NTuple{k, Int}, Int}()
+    for (i, m) in enumerate(__all_monos_sorted__)
+        mono_to_idx_exps[to_exps_tuple(m, k)] = i
+    end
+    global __mono_to_idx_exps__ = mono_to_idx_exps
+
+    pivotmap = Dict{Int, Vector{Int}}(); total_cols = 0
+    build_time = @elapsed begin
+        p = 0
+        while (1 << p) <= degree
+            k_op  = 1 << p; deg_g = degree - k_op
+            if k_op > 0 && deg_g >= 0
+                @printf "      Processing Sq^%d…\n" k_op
+                gen_exps = exps_enum(k, deg_g); nG = length(gen_exps)
+                processed = 0; batch = DEFAULT_BATCH
+                while processed < nG
+                    used = approx_used_mb()
+                    if used > HARD_MB
+                        @warn "RAM ~ $(round(used, digits=1))MB > HARD $(HARD_MB)MB; GC + shrink batch"
+                        GC.gc(true); batch = max(MIN_BATCH, batch ÷ 2)
+                    elseif used > SOFT_MB
+                        @info "RAM ~ $(round(used, digits=1))MB > SOFT $(SOFT_MB)MB; shrink batch"
+                        batch = max(MIN_BATCH, batch ÷ 2)
+                    elseif used < SOFT_MB / 2 && batch < MAX_BATCH
+                        batch = min(MAX_BATCH, batch * 2)
+                    end
+                    lo = processed + 1; hi = min(nG, processed + batch)
+                    bview = @view gen_exps[lo:hi]
+                    cols_exps = pmap(ex -> column_exps_only!(ex, k_op, k), bview; batch_size = 64)
+                    for rows_exps in cols_exps
+                        isempty(rows_exps) && continue
+                        rows = xor_rows_to_indices!(rows_exps, mono_to_idx_exps)
+                        isempty(rows) && continue
+                        total_cols += 1
+                        while !isempty(rows)
+                            r = rows[end]
+                            if haskey(pivotmap, r)
+                                rows = _xor_sorted_local(rows, pivotmap[r])
+                            else
+                                pivotmap[r] = copy(rows)
+                                break
+                            end
+                        end
+                    end
+                    processed = hi
+                    if processed % PRINT_EVERY == 0 || processed == nG
+                        @printf "        %d/%d generators, batch=%d, RAM≈%.1fMB, cols=%d, pivots=%d\n" processed nG batch approx_used_mb() total_cols length(pivotmap)
+                    end
+                end
+            end
+            p += 1
+        end
+    end
+
+    global __pivotmap__ = pivotmap
+    global __pivots__   = sort!(collect(keys(pivotmap)))
+    @printf "    - Online elimination: %d cols in %.1fs ; pivots=%d\n" total_cols build_time length(__pivots__)
+
+    num_monos = length(__all_monos_sorted__)
+    admissible_indices = let S = Set(__pivots__)
+        [i for i in 1:num_monos if !(i in S)]
+    end
+    admissible_basis = [__all_monos_sorted__[i] for i in admissible_indices]
+    global __admissible_indices__ = admissible_indices
+    global __admissible_basis__   = admissible_basis
+    global __adpos__ = Dict{Int,Int}(admissible_indices[i] => i for i in 1:length(admissible_indices))
+    empty!(__reduce_cache__)
+    @printf "    - Final admissible basis: %d\n" length(admissible_basis)
+    admissible_basis
+end
+
+# ---------- Reduction helpers ----------
+function reduce_global_index_to_admissible_positions(idx::Int)::Vector{Int}
+    cached = get(__reduce_cache__, idx, nothing)
+    cached !== nothing && return cached
+    v = [idx]; sort!(v)
+    i = length(v)
+    while i >= 1
+        r = v[i]
+        if haskey(__pivotmap__, r)
+            xor_sorted!(v, __pivotmap__[r]); sort!(v); i = length(v)
+        else
+            i -= 1
+        end
+    end
+    rows = Int[]
+    for g in v
+        p = get(__adpos__, g, 0)
+        p == 0 && continue
+        if any(==(p), rows); filter!(!=(p), rows) else; push!(rows, p) end
+    end
+    sort!(rows)
+    __reduce_cache__[idx] = rows
+    rows
+end
+
+function reduce_poly_to_admissible_rows_cached(p, k_vars)
+    isempty(monomials(p)) && return Int[]
+    rows_glob = Int[]
+    for m in monomials(p)
+        coeff(p, m) == base_ring(parent(p))(1) || continue
+        ex  = ntuple(i -> degree(m, i), k_vars)
+        idx = get(__mono_to_idx_exps__, ex, 0)
+        idx == 0 && continue
+        xor_sorted!(rows_glob, reduce_global_index_to_admissible_positions(idx))
+    end
+    rows_glob
+end
+
+# ---------- ρ action ----------
+function apply_rho_optimized_poly(p, j::Int, k_vars::Int)
+    P    = parent(p); gens = [gen(P, i) for i in 1:k_vars]
+    if j < k_vars
+        imgs = copy(gens); imgs[j], imgs[j + 1] = imgs[j + 1], imgs[j]
+    elseif j == k_vars && k_vars > 1
+        imgs = copy(gens); imgs[k_vars] = gens[k_vars] + gens[k_vars - 1]
+    else
+        return p
+    end
+    h = hom(P, P, imgs); h(p)
+end
+
+# ---------- BitMat + nullspace ----------
+struct BitMat
+    nrows::Int; ncols::Int; words_per_row::Int; data::Vector{UInt64}
+end
+BitMat(nrows::Int, ncols::Int) = BitMat(nrows, ncols, (ncols + 63) >>> 6, fill(0x00, nrows * ((ncols + 63) >>> 6)))
+@inline _idx(bm::BitMat, r::Int, c::Int) = ((r - 1) * bm.words_per_row + (((c - 1) >>> 6) + 1), UInt64(1) << (UInt64(c - 1) & 0x3f))
+@inline function setbit!(bm::BitMat, r::Int, c::Int); pos, bit = _idx(bm, r, c); bm.data[pos] ⊻= bit; end
+@inline function getwordptr(bm::BitMat, r::Int); b = (r - 1) * bm.words_per_row + 1; view(bm.data, b:b + bm.words_per_row - 1) end
+@inline function row_xor!(dst::SubArray{UInt64, 1}, src::SubArray{UInt64, 1}); @inbounds @simd for i in eachindex(dst); dst[i] ⊻= src[i]; end end
+
+function nullspace_bit!(bm::BitMat)
+    R = bm.nrows; C = bm.ncols; row = 1; pivcol = Int[]; pivrow = Int[]
+    for col in 1:C
+        prow = 0; mask = UInt64(1) << (UInt64(col - 1) & 0x3f); widx = (col - 1) >>> 6
+        for r in row:R
+            w = getwordptr(bm, r)
+            if (w[widx + 1] & mask) != 0; prow = r; break; end
+        end
+        prow == 0 && continue
+        if prow != row
+            w_prow = getwordptr(bm, prow); w_row  = getwordptr(bm, row)
+            tmp = copy(w_prow); w_prow .= w_row; w_row  .= tmp
+        end
+        push!(pivcol, col); push!(pivrow, row)
+        w_row = getwordptr(bm, row)
+        for r in row + 1:R
+            w_r = getwordptr(bm, r); ((w_r[widx + 1] & mask) != 0) && row_xor!(w_r, w_row)
+        end
+        row += 1; row > R && break
+    end
+    for k in length(pivcol):-1:1
+        c = pivcol[k]; r = pivrow[k]
+        mask = UInt64(1) << (UInt64(c - 1) & 0x3f); widx = (c - 1) >>> 6
+        w_r  = getwordptr(bm, r)
+        for rr in 1:r-1
+            w_rr = getwordptr(bm, rr); ((w_rr[widx + 1] & mask) != 0) && row_xor!(w_rr, w_r)
+        end
+    end
+    rank = length(pivcol)
+    freecols = Set(1:C); foreach(c -> delete!(freecols, c), pivcol)
+    free = sort(collect(freecols)); isempty(free) && return rank, BitVector[]
+    basis = BitVector[]
+    for f in free
+        v = falses(C); v[f] = true
+        for (k, c) in pairs(pivcol)
+            r = pivrow[k]; w_r = getwordptr(bm, r)
+            widxf = (f - 1) >>> 6; maskf = UInt64(1) << (UInt64(f - 1) & 0x3f)
+            ((w_r[widxf + 1] & maskf) != 0) && (v[c] ⊻= true)
+        end
+        push!(basis, v)
+    end
+    rank, basis
+end
+
+# ---------- Precompute (ρ_j - I) rows on admissible ----------
+function build_rho_rows_table!(admissible_basis::Vector, k_vars::Int, P)
+    @info "Precomputing (rho_j - I) rows on admissible basis for j=1..$k_vars"
+    table = Dict{Int, Vector{Vector{Int}}}()
+    N = length(admissible_basis)
+    for j in 1:k_vars
+        @printf "  • j=%d …\n" j
+        cols = Vector{Vector{Int}}(undef, N)
+        Threads.@threads for i in 1:N
+            b = admissible_basis[i]
+            p = apply_rho_optimized_poly(b, j, k_vars) + b
+            cols[i] = reduce_poly_to_admissible_rows_cached(p, k_vars)
+        end
+        table[j] = cols
+    end
+    global __rho_rows_table__ = table
+end
+
+# ---------- Weight environment ----------
+struct WeightEnv
+    idx2w::Vector{WeightKey}
+    w2idxs::Dict{WeightKey, Vector{Int}}
+    sorted_keys::Vector{WeightKey}
+end
+
+function build_weight_env(k_vars::Int)::WeightEnv
+    N = length(__admissible_basis__)
+    idx2w = Vector{WeightKey}(undef, N)
+    w2idxs = Dict{WeightKey, Vector{Int}}()
+    for i in 1:N
+        m = __admissible_basis__[i]
+        w = WeightKey(Tuple(get_weight_vector_optimized(m, k_vars)))
+        idx2w[i] = w
+        push!(get!(w2idxs, w, Int[]), i)
+    end
+    keys_sorted = sort(collect(keys(w2idxs)))
+    return WeightEnv(idx2w, w2idxs, keys_sorted)
+end
+
+# ---------- Helpers: project rows to a weight subspace ----------
+function project_rows_to_weight(rows::Vector{Int}, idxset::Set{Int}, localpos::Dict{Int,Int})
+    out = Int[]
+    for r in rows
+        if r in idxset
+            push!(out, localpos[r])
+        end
+    end
+    sort!(out); out
+end
+
+# ---------- Σ_k on a weight subspace ----------
+function sigma_on_weight(w::WeightKey, k_vars::Int, P, env::WeightEnv)
+    Widxs = env.w2idxs[w]; Nw = length(Widxs)
+    isempty(Widxs) && return BitVector[], Any[]
+    idxset = Set(Widxs)
+    localpos = Dict{Int,Int}(Widxs[i] => i for i in 1:Nw)
+
+    gens = collect(1:max(0, k_vars - 1))
+    isempty(gens) && return [BitVector([i == t for i in 1:Nw]) for t in 1:Nw], [__admissible_basis__[Widxs[i]] for i in 1:Nw]
+
+    BM = BitMat(length(gens) * Nw, Nw)
+    row0 = 0
+    for j in gens
+        col_rows_all = __rho_rows_table__[j]
+        for lc in 1:Nw
+            cglob = Widxs[lc]
+            rows = project_rows_to_weight(col_rows_all[cglob], idxset, localpos)
+            for r in rows; setbit!(BM, row0 + r, lc) end
+        end
+        row0 += Nw
+    end
+    _, ker = nullspace_bit!(BM)
+    sigma_polys = Any[]
+    for v in ker
+        p = zero(P)
+        for i in 1:Nw; v[i] && (p += __admissible_basis__[Widxs[i]]) end
+        !iszero(p) && push!(sigma_polys, p)
+    end
+    ker, sigma_polys
+end
+
+# ---------- GL_k on a weight subspace (from Sigma) ----------
+function gl_on_weight_from_sigma(w::WeightKey, k_vars::Int, P, env::WeightEnv,
+                                 kerS::Vector{BitVector}, sigma_polys::Vector)
+    Widxs = env.w2idxs[w]; Nw = length(Widxs)
+    isempty(kerS) && return Any[]
+    idxset = Set(Widxs)
+    localpos = Dict{Int,Int}(Widxs[i] => i for i in 1:Nw)
+
+    r = length(kerS)
+    BM = BitMat(Nw, r)   # only j=k (one block)
+    col_rows_k = __rho_rows_table__[k_vars]
+    for csmall in 1:r
+        rows = Int[]
+        v = kerS[csmall]
+        for i in 1:Nw
+            v[i] || continue
+            cglob = Widxs[i]
+            rr = project_rows_to_weight(col_rows_k[cglob], idxset, localpos)
+            xor_sorted!(rows, rr)
+        end
+        for r1 in rows; setbit!(BM, r1, csmall) end
+    end
+    _, ker2 = nullspace_bit!(BM)
+    gl_polys = Any[]
+    for y in ker2
+        p = zero(P)
+        for t in 1:length(y)
+            y[t] || continue
+            p += sigma_polys[t]
+        end
+        !iszero(p) && push!(gl_polys, p)
+    end
+    gl_polys
+end
+
+# ---------- Pretty printing ----------
+function poly_to_string_wrapped(p; width::Int = WRAP_WIDTH, indent::Int = 6)
+    monos = sort!(string.(collect(monomials(p))))
+    isempty(monos) && return "0"
+    lines = String[]; cur = repeat(" ", indent); first_token_global = true
+    for m in monos
+        token = first_token_global ? m : " + " * m
+        if length(cur) + length(token) > width
+            push!(lines, cur); cur = repeat(" ", indent) * " + " * m
+            first_token_global = false
+        else
+            cur *= token; first_token_global = false
+        end
+    end
+    push!(lines, cur); join(lines, "\n")
+end
+
+function print_invariants_labeled(kind::Symbol, k::Int, polys::Vector)
+    label = kind === :sigma ? "Sigma$(k)" : "GL$(k)"
+    println("\n" * "="^80)
+    println("FULL BASIS: $(label) invariants | dim = ", length(polys))
+    println("="^80)
+    if isempty(polys)
+        println("  (empty)"); return
+    end
+    for (i, p) in enumerate(polys)
+        println("  $(label)[$i] = ")
+        println(poly_to_string_wrapped(p; width = WRAP_WIDTH, indent = 6))
+    end
+end
+
+# ---------- NEW: print full bases of weight spaces (explicit) ----------
+function print_weight_bases(k::Int, env::WeightEnv)
+    println("\n" * "="^80)
+    @printf "WEIGHT-SPACE BASES (k=%d)\n" k
+    println("="^80)
+    for w in env.sorted_keys
+        members = env.w2idxs[w]
+        @printf "\n* Weight w=%s  |  dim = %d\n" string(w) length(members)
+        # list in lexicographic (dictionary) order of the monomial strings
+        mons = __admissible_basis__[members]
+        strs = sort!(string.(mons))
+        # print in two columns, with local numbering [1], [2], ...
+        usable = max(20, WRAP_WIDTH - 6); gap = 4; colw = max(10, (usable - gap) ÷ 2)
+        i = 1
+        while i <= length(strs)
+            left = @sprintf("[%3d] %s", i, strs[i]); left = length(left) > colw ? left[1:colw] : left
+            line = repeat(" ", 6) * rpad(left, colw)
+            if i + 1 <= length(strs)
+                right = @sprintf("[%3d] %s", i+1, strs[i+1]); right = length(right) > colw ? right[1:colw] : right
+                line *= repeat(" ", gap) * rpad(right, colw)
+                println(line); i += 2
+            else
+                println(line); i += 1
+            end
+        end
+    end
+end
+
+# ---------- Printing details per weight (Σ/GL) ----------
+function print_weight_invariants(k::Int, w::WeightKey, sigpolys::Vector, glpolys::Vector)
+    @printf "\n--- DETAILS for weight w=%s ---\n" string(w)
+    @printf "Sigma_%d invariants on w (dim=%d):\n" k length(sigpolys)
+    if isempty(sigpolys)
+        println("  (none)")
+    else
+        for (i, p) in enumerate(sigpolys)
+            println(@sprintf("  Σ[%d] =", i))
+            println(poly_to_string_wrapped(p; width=WRAP_WIDTH, indent=6))
+        end
+    end
+    @printf "GL_%d invariants on w (dim=%d):\n" k length(glpolys)
+    if isempty(glpolys)
+        println("  (none)")
+    else
+        for (i, p) in enumerate(glpolys)
+            println(@sprintf("  GL[%d] =", i))
+            println(poly_to_string_wrapped(p; width=WRAP_WIDTH, indent=6))
+        end
+    end
+end
+
+# ---------- Stage 1: kernel for f ≡ γ g + Σ β_i g'_i with (ρ_j−I)f≡0, j=1..k−1 ----------
+function stage1_kernel(k_vars::Int, P, g_poly, lower_cols_idx::Vector{Int})
+    N = length(__admissible_basis__)
+    m = length(lower_cols_idx)
+    BM = BitMat((k_vars - 1) * N, 1 + m)
+
+    # Column 1 (gamma): stacked rows of (ρ_j−I)g
+    for j in 1:k_vars-1
+        rr = reduce_poly_to_admissible_rows_cached(apply_rho_optimized_poly(g_poly, j, k_vars) + g_poly, k_vars)
+        off = (j - 1) * N
+        for r1 in rr; setbit!(BM, off + r1, 1) end
+    end
+
+    # Columns for each lower monomial g'_t
+    for (t, cglob) in enumerate(lower_cols_idx)
+        for j in 1:k_vars-1
+            rr = __rho_rows_table__[j][cglob]
+            off = (j - 1) * N
+            for r1 in rr; setbit!(BM, off + r1, 1 + t) end
+        end
+    end
+
+    rk, ker = nullspace_bit!(BM)  # ker is list of BitVector length (1+m)
+    return ((k_vars - 1) * N, 1 + m, rk, ker)
+end
+
+# Polynomial basis for the Stage 1 kernel: φ_j = (γ_j ? g : 0) + Σ (β_{j,t} ? g'_t : 0)
+function build_kernel_phi_basis(P, g_poly, lower_cols_idx::Vector{Int}, ker::Vector{BitVector})
+    r = length(ker)
+    phi = Vector{Any}(undef, r)
+    for j in 1:r
+        v = ker[j]
+        p = iszero(v[1]) ? zero(P) : g_poly
+        for t in 1:length(lower_cols_idx)
+            v[1 + t] && (p += __admissible_basis__[lower_cols_idx[t]])
+        end
+        phi[j] = p
+    end
+    return phi
+end
+
+# ---------- Stage 2: solve (ρ_k−I) Σ λ_j φ_j = 0 on λ ----------
+function stage2_lambda_solutions(k_vars::Int, phi_basis::Vector)
+    N = length(__admissible_basis__)
+    r = length(phi_basis)
+    BM2 = BitMat(N, r)
+    for j in 1:r
+        eff = apply_rho_optimized_poly(phi_basis[j], k_vars, k_vars) + phi_basis[j]
+        rows = reduce_poly_to_admissible_rows_cached(eff, k_vars)
+        for r1 in rows; setbit!(BM2, r1, j) end
+    end
+    _, ker2 = nullspace_bit!(BM2)
+    return ker2
+end
+
+# ---------- VERIFY full GL invariance (i=1..k) ----------
+function verify_global_GL_invariance!(p, k_vars::Int)
+    bad = Int[]
+    for j in 1:k_vars
+        diff = apply_rho_optimized_poly(p, j, k_vars) + p
+        rows = reduce_poly_to_admissible_rows_cached(diff, k_vars)
+        if !isempty(rows)
+            push!(bad, j)
+        end
+    end
+    bad
+end
+
+# ---------- MAIN (highest-weight-only) ----------
+function ultra_sparse_bitpacked_main(k_vars::Int, degree::Int; spill_dir::Union{String,Nothing}=nothing)
+    spill_dir = isnothing(spill_dir) ? get(ENV, "SPILL_DIR_DEFAULT", "hit_spill") : spill_dir
+
+    setup_logging(k_vars, degree)
+    tot = @elapsed begin
+        println("="^80)
+        @printf "SPARSE-HIT + ONLINE-ELIM + Σ_k/GL_k by WEIGHTS (k=%d, d=%d) | procs=%d, threads=%d\n" k_vars degree nprocs() Threads.nthreads()
+        println("="^80)
+        P, _ = polynomial_ring(GF(2), ["x$i" for i in 1:k_vars])
+        try
+            # ---- STEP 1: Admissible ----
+            println("\n--> STEP 1: Admissible basis")
+            find_admissible_basis_streaming(degree, k_vars, P)
+
+            # ---- PRECOMPUTE rows of (ρ_j−I) on admissible ----
+            build_rho_rows_table!(__admissible_basis__, k_vars, P)
+
+            # ---- WEIGHT ENV + SUMMARY ----
+            env = build_weight_env(k_vars)
+            print("\n[WEIGHT SUMMARY] ")
+            for w in env.sorted_keys
+                @printf "w=%s, dim=%d " string(w) length(env.w2idxs[w])
+            end
+            println()
+
+            # ---- NEW: print explicit bases for each weight (right below summary) ----
+            print_weight_bases(k_vars, env)
+
+            # ---- Compute Σ/GL per weight + print details ----
+            sigma_by_w  = Dict{WeightKey, Vector{Any}}()
+            gl_by_w     = Dict{WeightKey, Vector{Any}}()
+            gl_dims     = Dict{WeightKey, Int}()
+            println()
+            for w in env.sorted_keys
+                kerS, sigpolys = sigma_on_weight(w, k_vars, P, env)
+                glpolys = gl_on_weight_from_sigma(w, k_vars, P, env, kerS, sigpolys)
+                sigma_by_w[w] = sigpolys
+                gl_by_w[w]    = glpolys
+                gl_dims[w]    = length(glpolys)
+                @printf "[W] w=%s | dimGL=%d\n" string(w) length(glpolys)
+            end
+
+            for w in env.sorted_keys
+                print_weight_invariants(k_vars, w, get(sigma_by_w, w, Any[]), get(gl_by_w, w, Any[]))
+            end
+
+            # ---- ONLY the largest weight having GL≠0 ----
+            ws_gl = [w for w in env.sorted_keys if get(gl_dims, w, 0) > 0]
+            if isempty(ws_gl)
+                println("\n" * "="^80)
+                println("No weight has GL≠0. Nothing to adjust.")
+                println("="^80)
+                return
+            end
+            w_star = maximum(ws_gl)
+            println("\n" * "="^80)
+            @printf "Proceed ONLY with the largest weight having GL≠0: w* = %s (dimGL=%d)\n" string(w_star) get(gl_dims, w_star, 0)
+            println("="^80)
+
+            # ---- Set of lower cols: all admissible indices of weights < w* ----
+            lower_cols_idx = Int[]
+            for w in env.sorted_keys
+                (w < w_star) || continue
+                append!(lower_cols_idx, env.w2idxs[w])
+            end
+
+            final_global = Any[]
+
+            # iterate GL_k invariants inside w*
+            for (gidx, gmax) in enumerate(gl_by_w[w_star])
+                println("\n" * "="^80)
+                @printf "Processing g_max[%d] @ weight %s\n" gidx string(w_star)
+                println("="^80)
+
+                # ------------- Stage 1 -------------
+                n_eq1, n_var1, rk1, ker1 = stage1_kernel(k_vars, P, gmax, lower_cols_idx)
+                @printf "\nDERIVATION — Stage 1 (solve f ≡ γ·g + Σ β_i g'_i, i=1..k-1)\n"
+                println("="^80)
+                @printf "System size: %d eqs, %d unknowns (γ + β_i). Nullity = %d.\n" n_eq1 n_var1 length(ker1)
+
+                if isempty(ker1)
+                    println("[SKIP] Stage 1 kernel empty → no candidate.")
+                    continue
+                end
+
+                phi_basis = build_kernel_phi_basis(P, gmax, lower_cols_idx, ker1)
+
+                # row-keys to interpret h0 & groups g''_s
+                key_gamma = ntuple(j -> Int(ker1[j][1]), length(ker1))
+                key_beta  = [ ntuple(j -> Int(ker1[j][1+t]), length(ker1)) for t in 1:length(lower_cols_idx) ]
+
+                eq_gamma_t = Int[]
+                class_map  = Dict{NTuple, Vector{Int}}()
+                for t in 1:length(lower_cols_idx)
+                    krow = key_beta[t]
+                    all(==(0), krow) && continue
+                    if krow == key_gamma
+                        push!(eq_gamma_t, t)
+                    else
+                        push!(get!(class_map, krow, Int[]), t)
+                    end
+                end
+
+                groups_keys  = collect(keys(class_map))
+                groups_tsets = [class_map[k] for k in groups_keys]
+                groups_polys = Vector{Any}(undef, length(groups_tsets))
+                for s in 1:length(groups_tsets)
+                    p = zero(P)
+                    for t in groups_tsets[s]
+                        p += __admissible_basis__[lower_cols_idx[t]]
+                    end
+                    groups_polys[s] = p
+                end
+
+                if isempty(eq_gamma_t)
+                    println("\n[h0] group (β_i = γ): empty → h0 = 0")
+                else
+                    h0_view = zero(P)
+                    for t in eq_gamma_t; h0_view += __admissible_basis__[lower_cols_idx[t]]; end
+                    println("\n[h0] group (β_i = γ) — members t = {", join(eq_gamma_t, ", "), "}")
+                    println("h0 ="); println(poly_to_string_wrapped(h0_view))
+                end
+
+                println("\n[g''_s] groups by global equalities (independent of λ):")
+                if isempty(groups_tsets)
+                    println("  (none)")
+                else
+                    for s in 1:length(groups_tsets)
+                        println(@sprintf("  g''[%d] members t={%s}", s, join(groups_tsets[s], ", ")))
+                        println(poly_to_string_wrapped(groups_polys[s]))
+                    end
+                end
+
+                # ------------- Stage 2 -------------
+                println("\n" * "-"^80)
+                println("DERIVATION — Stage 2 (apply ρ_k − I in kernel coordinates λ)")
+                println("-"^80)
+
+                ker2 = stage2_lambda_solutions(k_vars, phi_basis)
+                @printf "Final system size: %d equations, %d unknowns (λ). Nullity = %d.\n" length(__admissible_basis__) length(phi_basis) length(ker2)
+
+                if isempty(ker2)
+                    println("[SKIP] No λ-solution for Stage 2.")
+                    continue
+                end
+
+                sol_count = 0
+                for λ in ker2
+                    sol_count += 1
+                    f_final = zero(P)
+                    for j in 1:length(λ)
+                        λ[j] && (f_final += phi_basis[j])
+                    end
+
+                    # interpret gamma, betas, h0 and δ_s from λ
+                    γ = false
+                    for j in 1:length(λ); if λ[j] && (key_gamma[j]==1); γ = !γ; end; end
+
+                    βvals = BitVector(undef, length(lower_cols_idx))
+                    for t in 1:length(lower_cols_idx)
+                        sbit = false
+                        kt = key_beta[t]
+                        for j in 1:length(λ); if λ[j] && (kt[j]==1); sbit = !sbit; end; end
+                        βvals[t] = sbit
+                    end
+
+                    h0_sol = zero(P)
+                    for t in 1:length(lower_cols_idx)
+                        (βvals[t] == γ) && (h0_sol += __admissible_basis__[lower_cols_idx[t]])
+                    end
+
+                    δ_on = Int[]
+                    for s in 1:length(groups_keys)
+                        ks = groups_keys[s]
+                        bit = false
+                        for j in 1:length(λ); if λ[j] && (ks[j]==1); bit = !bit; end; end
+                        bit && push!(δ_on, s)
+                    end
+
+                    println(@sprintf("\n[Solution %d] (in kernel coords λ)", sol_count))
+                    println(@sprintf("  gamma = %d", Int(γ)))
+                    if isempty(δ_on)
+                        println("  all δ_s = 0")
+                    else
+                        println(@sprintf("  δ_s = 1 at s ∈ {%s}", join(δ_on, ", ")))
+                    end
+
+                    println("\n[h0 from this solution] =")
+                    println(poly_to_string_wrapped(h0_sol))
+
+                    println("\n[Candidate f] =")
+                    println(poly_to_string_wrapped(f_final))
+
+                    bad = verify_global_GL_invariance!(f_final, k_vars)
+                    if isempty(bad)
+                        println("[VERIFY] PASSED for all ρ_i, i=1..k.  → ACCEPT")
+                        push!(final_global, f_final)
+                    else
+                        println(@sprintf("[VERIFY] FAILED: non-zero residues for i in %s → REJECT", string(bad)))
+                    end
+                end
+            end
+
+            println("\n" * "="^80)
+            @printf "GLOBAL GL_k INVARIANTS (verified modulo hit): dim = %d\n" length(final_global)
+            println("="^80)
+            print_invariants_labeled(:gl, k_vars, final_global)
+
+        catch e
+            println("\nAN ERROR OCCURRED:")
+            showerror(stdout, e, catch_backtrace())
+            println()
+        end
+    end
+    @printf "\nTotal time: %.2fs (%.2f min)\n" tot tot/60
+    println("="^80)
+    @info "Full results were written to $( __LOG_FILENAME__[] )"
+end
+
+# -------- RUN (example) --------
+ultra_sparse_bitpacked_main(5, 71)
+
